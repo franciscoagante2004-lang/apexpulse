@@ -1814,8 +1814,7 @@ function obFinish(){
 // CLOUD AUTH & REAL-TIME SYNC (ApexCloud)
 // ===========================
 const ApexCloud = {
-  REGISTRY_ID: 'ff8081819ff5b11001a043f809f139d9',
-  API_BASE: 'https://api.restful-api.dev/objects',
+  ENDPOINT: 'https://bytebin.lucko.me',
   syncTimer: null,
   isSyncing: false,
 
@@ -1823,162 +1822,20 @@ const ApexCloud = {
     return DB.get('ap_cloud_user', null);
   },
 
-  async hashPassword(email, password) {
-    const encoder = new TextEncoder();
-    const data = encoder.encode(email.toLowerCase().trim() + '::' + password.trim() + '::apexpulse_cloud_salt_2026');
-    const hashBuffer = await crypto.subtle.digest('SHA-256', data);
-    const hashArray = Array.from(new Uint8Array(hashBuffer));
-    return 'u_' + hashArray.map(b => b.toString(16).padStart(2, '0')).join('').slice(0, 24);
-  },
-
-  async getRegistry() {
-    try {
-      const res = await fetch(`${this.API_BASE}/${this.REGISTRY_ID}`);
-      if (!res.ok) return {};
-      const json = await res.json();
-      return json.data || {};
-    } catch (e) {
-      console.warn('Error fetching registry:', e);
-      return {};
-    }
-  },
-
-  async updateRegistry(accKey, docId) {
-    try {
-      const current = await this.getRegistry();
-      current[accKey] = docId;
-      await fetch(`${this.API_BASE}/${this.REGISTRY_ID}`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          name: 'APEXPULSE_GLOBAL_INDEX_V1',
-          data: current
-        })
-      });
-    } catch (e) {
-      console.warn('Error updating registry:', e);
-    }
-  },
-
-  async register(email, password, name) {
-    email = email.toLowerCase().trim();
-    password = password.trim();
-    if (!email || !password) throw new Error('Preenche o email e a palavra-passe.');
-    if (password.length < 4) throw new Error('A palavra-passe deve ter pelo menos 4 caracteres.');
-
-    toast('A conectar à nuvem...', 'info');
-    const accKey = await this.hashPassword(email, password);
-    const registry = await this.getRegistry();
-
-    let docId = registry[accKey];
-
-    const payload = {
-      updatedAt: Date.now(),
-      profile: getProfile(),
-      workouts: DB.get('ap_workouts', []),
-      nutrition: DB.get('ap_nutrition', {}),
-      metrics: DB.get('ap_metrics', []),
-      custom_foods: DB.get('ap_custom_foods', []),
-      custom_exercises: DB.get('ap_custom_exercises', []),
-      custom_templates: DB.get('ap_custom_templates', [])
-    };
-    if (name) payload.profile.name = name;
-
-    if (docId) {
-      await fetch(`${this.API_BASE}/${docId}`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name: `ApexUser_${accKey}`, data: payload })
-      });
-    } else {
-      const res = await fetch(this.API_BASE, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name: `ApexUser_${accKey}`, data: payload })
-      });
-      if (!res.ok) throw new Error('Falha ao criar o registo na nuvem.');
-      const json = await res.json();
-      docId = json.id;
-      await this.updateRegistry(accKey, docId);
-    }
-
-    const user = {
-      email,
-      name: name || payload.profile.name || email.split('@')[0],
-      accKey,
-      docId,
-      registeredAt: new Date().toISOString(),
-      lastSync: new Date().toISOString()
-    };
-
-    DB.set('ap_cloud_user', user);
-    if (name) {
-      const p = getProfile(); p.name = name; DB.set('ap_profile', p);
-    }
-
-    this.updateUI();
-    return user;
-  },
-
-  async login(email, password) {
-    email = email.toLowerCase().trim();
-    password = password.trim();
-    if (!email || !password) throw new Error('Preenche o email e a palavra-passe.');
-
-    toast('A procurar conta na nuvem...', 'info');
-    const accKey = await this.hashPassword(email, password);
-    const registry = await this.getRegistry();
-    const docId = registry[accKey];
-
-    if (!docId) {
-      throw new Error('Conta não encontrada com estes dados. Cria primeiro a conta na aba "Criar Nova Conta".');
-    }
-
-    const res = await fetch(`${this.API_BASE}/${docId}`);
-    if (!res.ok) throw new Error('Erro ao transferir dados da nuvem.');
-    const json = await res.json();
-    const cloudData = json.data;
-
-    if (cloudData) {
-      if (cloudData.workouts) DB.set('ap_workouts', cloudData.workouts);
-      if (cloudData.nutrition) DB.set('ap_nutrition', cloudData.nutrition);
-      if (cloudData.metrics) DB.set('ap_metrics', cloudData.metrics);
-      if (cloudData.profile) DB.set('ap_profile', cloudData.profile);
-      if (cloudData.custom_foods) DB.set('ap_custom_foods', cloudData.custom_foods);
-      if (cloudData.custom_exercises) DB.set('ap_custom_exercises', cloudData.custom_exercises);
-      if (cloudData.custom_templates) DB.set('ap_custom_templates', cloudData.custom_templates);
-    }
-
-    const user = {
-      email,
-      name: (cloudData && cloudData.profile && cloudData.profile.name) || email.split('@')[0],
-      accKey,
-      docId,
-      lastSync: new Date().toISOString()
-    };
-
-    DB.set('ap_cloud_user', user);
-    this.updateUI();
-    return user;
-  },
-
-  logout() {
-    DB.set('ap_cloud_user', null);
-    this.updateUI();
-    toast('Sessão terminada neste dispositivo.', 'info');
-  },
-
   async push() {
-    const user = this.getUser();
-    if (!user || !user.docId) return;
-    if (this.isSyncing) return;
+    if (this.isSyncing) return null;
     this.isSyncing = true;
     this.setSyncStatus('syncing');
 
     try {
+      const user = this.getUser() || {};
       const payload = {
+        app: 'ApexPulse Pro',
+        version: '1.0.0',
+        userEmail: user.email || '',
+        userName: user.name || getProfile().name || 'Atleta',
         updatedAt: Date.now(),
-        profile: DB.get('ap_profile', {}),
+        profile: getProfile(),
         workouts: DB.get('ap_workouts', []),
         nutrition: DB.get('ap_nutrition', {}),
         metrics: DB.get('ap_metrics', []),
@@ -1987,58 +1844,77 @@ const ApexCloud = {
         custom_templates: DB.get('ap_custom_templates', [])
       };
 
-      const res = await fetch(`${this.API_BASE}/${user.docId}`, {
-        method: 'PUT',
+      const res = await fetch(`${this.ENDPOINT}/post`, {
+        method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name: `ApexUser_${user.accKey}`, data: payload })
+        body: JSON.stringify(payload)
       });
 
-      if (res.ok) {
-        user.lastSync = new Date().toISOString();
-        DB.set('ap_cloud_user', user);
-        this.setSyncStatus('synced');
-      } else {
-        this.setSyncStatus('offline');
-      }
+      if (!res.ok) throw new Error('Falha ao enviar para a nuvem');
+      const json = await res.json();
+      const key = json.key;
+
+      user.syncKey = key;
+      user.lastSync = new Date().toISOString();
+      DB.set('ap_cloud_user', user);
+      localStorage.setItem('apex_last_synckey', key);
+
+      this.setSyncStatus('synced');
+      this.updateUI();
+      return key;
     } catch (e) {
       console.warn('Sync push error:', e);
       this.setSyncStatus('offline');
+      throw e;
     } finally {
       this.isSyncing = false;
     }
   },
 
-  async pull(forceReload = false) {
-    const user = this.getUser();
-    if (!user || !user.docId) return;
+  async pullByKey(key) {
+    if (!key) throw new Error('Chave de sincronização em falta.');
+    key = key.trim();
     this.setSyncStatus('syncing');
 
     try {
-      const res = await fetch(`${this.API_BASE}/${user.docId}`);
-      if (!res.ok) throw new Error('Cloud unreachable');
-      const json = await res.json();
-      const d = json.data;
+      const res = await fetch(`${this.ENDPOINT}/${key}`);
+      if (!res.ok) throw new Error('Chave não encontrada na nuvem. Confirma se digitaste corretamente.');
+      const data = await res.json();
 
-      if (d) {
-        if (d.workouts) DB.set('ap_workouts', d.workouts);
-        if (d.nutrition) DB.set('ap_nutrition', d.nutrition);
-        if (d.metrics) DB.set('ap_metrics', d.metrics);
-        if (d.profile) DB.set('ap_profile', d.profile);
-        if (d.custom_foods) DB.set('ap_custom_foods', d.custom_foods);
-        if (d.custom_exercises) DB.set('ap_custom_exercises', d.custom_exercises);
-        if (d.custom_templates) DB.set('ap_custom_templates', d.custom_templates);
+      if (data) {
+        if (data.workouts) DB.set('ap_workouts', data.workouts);
+        if (data.nutrition) DB.set('ap_nutrition', data.nutrition);
+        if (data.metrics) DB.set('ap_metrics', data.metrics);
+        if (data.profile) DB.set('ap_profile', data.profile);
+        if (data.custom_foods) DB.set('ap_custom_foods', data.custom_foods);
+        if (data.custom_exercises) DB.set('ap_custom_exercises', data.custom_exercises);
+        if (data.custom_templates) DB.set('ap_custom_templates', data.custom_templates);
 
-        user.lastSync = new Date().toISOString();
+        const user = {
+          email: data.userEmail || '',
+          name: data.userName || (data.profile && data.profile.name) || 'Atleta',
+          syncKey: key,
+          lastSync: new Date().toISOString()
+        };
+
         DB.set('ap_cloud_user', user);
-        this.setSyncStatus('synced');
+        localStorage.setItem('apex_last_synckey', key);
 
-        if (forceReload) {
-          goTo(currentTab);
-        }
+        this.setSyncStatus('synced');
+        this.updateUI();
+        goTo(currentTab);
+        return user;
       }
     } catch (e) {
       this.setSyncStatus('offline');
+      throw e;
     }
+  },
+
+  logout() {
+    DB.set('ap_cloud_user', null);
+    this.updateUI();
+    toast('Sessão terminada neste dispositivo.', 'info');
   },
 
   setSyncStatus(status) {
@@ -2060,8 +1936,8 @@ const ApexCloud = {
       if (topBadge) topBadge.innerHTML = '⚪ Offline';
     } else {
       if (dot) { dot.style.background = '#555'; dot.title = 'Sem conta associada'; }
-      if (sub) sub.innerHTML = '<span class="text-muted">☁️ Entrar / Criar Conta</span>';
-      if (topBadge) topBadge.innerHTML = '☁️ Entrar';
+      if (sub) sub.innerHTML = '<span class="text-muted">☁️ Sincronizar Nuvem</span>';
+      if (topBadge) topBadge.innerHTML = '☁️ Sincronizar';
     }
   },
 
@@ -2069,61 +1945,37 @@ const ApexCloud = {
     const user = this.getUser();
     const p = getProfile();
     const nameEl = document.getElementById('sidebar-name');
-    if (nameEl) nameEl.textContent = user ? (p.name || user.email.split('@')[0]) : (p.name || 'Atleta');
-    this.setSyncStatus(user ? 'synced' : 'none');
+    if (nameEl) nameEl.textContent = user ? (user.name || p.name || 'Atleta') : (p.name || 'Atleta');
+    this.setSyncStatus(user && user.syncKey ? 'synced' : 'none');
   },
 
   init() {
-    this.updateUI();
-    window.addEventListener('focus', () => {
-      if (this.getUser()) this.pull(true);
-    });
-    window.addEventListener('online', () => {
-      if (this.getUser()) {
-        this.push();
-        toast('Ligação recuperada. Dados sincronizados com a nuvem! ☁️', 'ok');
+    // Check URL hash for automatic pairing (e.g., #sync=KEY)
+    const hash = window.location.hash;
+    if (hash && hash.includes('sync=')) {
+      const key = hash.split('sync=')[1].split('&')[0];
+      if (key) {
+        setTimeout(async () => {
+          try {
+            await this.pullByKey(key);
+            toast('Dispositivo emparelhado e sincronizado com sucesso! 🎉', 'ok');
+            history.replaceState(null, null, ' ');
+          } catch (e) {
+            toast('Erro ao sincronizar via link', 'err');
+          }
+        }, 300);
       }
-    });
-
-    if (this.getUser()) {
-      this.pull(false);
     }
 
-    setInterval(() => {
-      if (this.getUser() && navigator.onLine && !this.isSyncing) this.push();
-    }, 60000);
+    this.updateUI();
   }
 };
 
-function openAuthModal(tab = 'login') {
+function openAuthModal(tab = 'pair') {
   const user = ApexCloud.getUser();
-  if (user) {
-    openModal(`
-      <div style="display:flex;flex-direction:column;gap:14px">
-        <div class="flex justify-between items-center">
-          <div class="text-lg">☁️ A Tua Conta Cloud</div>
-          <button class="btn btn-secondary btn-sm" onclick="closeModal()">✕</button>
-        </div>
-        <div class="card" style="padding:14px">
-          <div class="flex items-center gap3">
-            <div style="width:44px;height:44px;border-radius:50%;background:linear-gradient(135deg,var(--green),var(--indigo));display:flex;align-items:center;justify-content:center;font-size:20px;color:#000;font-weight:900">
-              ${(user.name||user.email)[0].toUpperCase()}
-            </div>
-            <div>
-              <div style="font-weight:800;font-size:14px">${h(user.name || 'Atleta')}</div>
-              <div class="text-xs text-muted">${h(user.email)}</div>
-              <div class="text-xs text-green mt1">🟢 Sincronizado em tempo real</div>
-            </div>
-          </div>
-        </div>
-        <div class="flex gap2">
-          <button class="btn btn-primary" style="flex:1" onclick="ApexCloud.push();toast('Sincronizado!');closeModal();">🔄 Sincronizar Agora</button>
-          <button class="btn btn-danger" onclick="ApexCloud.logout();closeModal();">🚪 Sair</button>
-        </div>
-      </div>
-    `);
-    return;
-  }
+  const currentKey = (user && user.syncKey) || localStorage.getItem('apex_last_synckey') || '';
+  const shareUrl = currentKey ? `${window.location.origin}${window.location.pathname}#sync=${currentKey}` : '';
+  const qrUrl = shareUrl ? `https://api.qrserver.com/v1/create-qr-code/?size=160x160&data=${encodeURIComponent(shareUrl)}` : '';
 
   openModal(`
     <div style="display:flex;flex-direction:column;gap:14px">
@@ -2131,52 +1983,86 @@ function openAuthModal(tab = 'login') {
         <div class="text-lg">☁️ Sincronização Multi-Dispositivo</div>
         <button class="btn btn-secondary btn-sm" onclick="closeModal()">✕</button>
       </div>
+
       <div style="display:flex;gap:6px;border-bottom:1px solid var(--border);padding-bottom:8px">
-        <button class="btn ${tab==='login'?'btn-primary':'btn-secondary'} btn-sm" style="flex:1" onclick="openAuthModal('login')">Iniciar Sessão</button>
-        <button class="btn ${tab==='register'?'btn-primary':'btn-secondary'} btn-sm" style="flex:1" onclick="openAuthModal('register')">Criar Nova Conta</button>
+        <button class="btn ${tab==='pair'?'btn-primary':'btn-secondary'} btn-sm" style="flex:1" onclick="openAuthModal('pair')">📲 Enviar deste Dispositivo</button>
+        <button class="btn ${tab==='receive'?'btn-primary':'btn-secondary'} btn-sm" style="flex:1" onclick="openAuthModal('receive')">📥 Receber / Conectar</button>
       </div>
-      ${tab === 'login' ? `
-        <div style="display:flex;flex-direction:column;gap:10px">
-          <div><label>Email</label><input type="text" id="auth-email" placeholder="o-teu-email@exemplo.com" autofocus></div>
-          <div><label>Palavra-passe</label><input type="password" id="auth-pass" placeholder="A tua palavra-passe" onkeydown="if(event.key==='Enter')submitAuth('login')"></div>
-          <button class="btn btn-primary w100 mt2" onclick="submitAuth('login')">🔑 Iniciar Sessão e Sincronizar</button>
-          <div class="text-xs text-muted" style="text-align:center">Ao entrar no teu telemóvel ou PC, os dados sincronizam automaticamente.</div>
+
+      ${tab === 'pair' ? `
+        <div style="display:flex;flex-direction:column;gap:12px">
+          <div class="text-xs text-muted">Gera um código ou lê o QR Code com o teu telemóvel para transferir e sincronizar todos os treinos e calorias:</div>
+          
+          <button class="btn btn-primary w100" id="btn-gen-cloud" onclick="handleGenerateCloudKey()">
+            ☁️ Gerar Código de Sincronização
+          </button>
+
+          <div id="cloud-key-box" style="${currentKey ? 'display:flex' : 'display:none'};flex-direction:column;gap:10px;background:var(--card);border:1px solid var(--green);border-radius:8px;padding:14px;align-items:center;text-align:center">
+            <div class="text-xs text-green" style="font-weight:700">✓ DADOS PRONTOS NA NUVEM!</div>
+            
+            <div style="font-size:11px;color:var(--slate3)">O teu Código de Sincronização:</div>
+            <div id="display-sync-key" style="font-size:24px;font-weight:900;letter-spacing:3px;color:var(--green);background:var(--surface);padding:8px 18px;border-radius:6px;border:1px dashed var(--green)">
+              ${currentKey || '—'}
+            </div>
+
+            ${qrUrl ? `
+              <div style="margin-top:6px">
+                <img id="qr-img" src="${qrUrl}" alt="QR Code de Sincronização" style="border-radius:8px;border:2px solid #fff;background:#fff;padding:4px">
+                <div class="text-xs text-muted mt1">Aponta a câmara do telemóvel para abrir diretamente</div>
+              </div>
+            ` : ''}
+          </div>
         </div>
       ` : `
-        <div style="display:flex;flex-direction:column;gap:10px">
-          <div><label>O teu Nome</label><input type="text" id="auth-name" placeholder="Ex: Francisco" autofocus></div>
-          <div><label>Email</label><input type="text" id="auth-email" placeholder="o-teu-email@exemplo.com"></div>
-          <div><label>Palavra-passe</label><input type="password" id="auth-pass" placeholder="Mínimo 4 caracteres" onkeydown="if(event.key==='Enter')submitAuth('register')"></div>
-          <button class="btn btn-primary w100 mt2" onclick="submitAuth('register')">✨ Criar Conta & Ativar Nuvem</button>
-          <div class="text-xs text-muted" style="text-align:center">Os teus treinos e calorias atuais serão guardados nesta conta.</div>
+        <div style="display:flex;flex-direction:column;gap:12px">
+          <div class="text-xs text-muted">Introduz o Código de Sincronização gerado no teu outro dispositivo (ex: no teu PC):</div>
+          
+          <div>
+            <label>Código de Sincronização</label>
+            <input type="text" id="input-sync-key" placeholder="Ex: EIBBLqo7UC" style="font-size:18px;font-weight:800;text-align:center;letter-spacing:2px;text-transform:none" autofocus>
+          </div>
+
+          <button class="btn btn-primary w100 mt1" onclick="handleConnectKey()">
+            📥 Conectar & Sincronizar Tudo
+          </button>
+          
+          <div class="text-xs text-muted" style="text-align:center">Todos os treinos, alimentos e métricas serão transferidos instantaneamente.</div>
         </div>
       `}
     </div>
   `);
 }
 
-async function submitAuth(type) {
-  const email = (document.getElementById('auth-email')?.value || '').trim();
-  const pass = (document.getElementById('auth-pass')?.value || '').trim();
-  const name = (document.getElementById('auth-name')?.value || '').trim();
+async function handleGenerateCloudKey() {
+  const btn = document.getElementById('btn-gen-cloud');
+  if (btn) { btn.disabled = true; btn.textContent = '⏳ A enviar dados para a nuvem...'; }
 
-  if (!email || !pass) {
-    toast('Preenche o email e a palavra-passe.', 'err');
+  try {
+    const key = await ApexCloud.push();
+    toast('Dados guardados na nuvem com sucesso! ☁️', 'ok');
+    openAuthModal('pair');
+  } catch (err) {
+    toast('Erro ao ligar à nuvem. Tenta novamente.', 'err');
+    if (btn) { btn.disabled = false; btn.textContent = '☁️ Gerar Código de Sincronização'; }
+  }
+}
+
+async function handleConnectKey() {
+  const input = document.getElementById('input-sync-key');
+  const key = (input ? input.value : '').trim();
+
+  if (!key) {
+    toast('Digita o código de sincronização.', 'err');
     return;
   }
 
+  toast('A transferir dados da nuvem...', 'info');
   try {
-    if (type === 'login') {
-      await ApexCloud.login(email, pass);
-      toast('Sessão iniciada! Dados sincronizados ☁️', 'ok');
-    } else {
-      await ApexCloud.register(email, pass, name);
-      toast('Conta criada com sucesso! Sincronização ativa ☁️', 'ok');
-    }
+    await ApexCloud.pullByKey(key);
+    toast('Sincronização concluída com sucesso! 🎉', 'ok');
     closeModal();
-    goTo(currentTab);
   } catch (err) {
-    toast(err.message || 'Erro ao autenticar', 'err');
+    toast(err.message || 'Código inválido ou expirado.', 'err');
   }
 }
 
