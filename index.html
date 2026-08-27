@@ -1903,8 +1903,10 @@ const ApexCloud = {
     return id;
   })(),
   mqttClient: null,
+  localChannel: typeof BroadcastChannel !== 'undefined' ? new BroadcastChannel('apexpulse_live_bus') : null,
   syncTimer: null,
   isSyncing: false,
+  lastRemoteUpdate: 0,
 
   getUser() {
     return DB.get('ap_cloud_user', null);
@@ -1924,12 +1926,13 @@ const ApexCloud = {
     }
 
     try {
-      const topic = 'apexpulse/live/' + key.trim();
+      const cleanKey = key.trim().toLowerCase();
+      const topic = 'apexpulse/live/' + cleanKey;
       this.mqttClient = mqtt.connect('wss://broker.hivemq.com:8884/mqtt', {
         clientId: 'apex_' + this.deviceId + '_' + Math.random().toString(16).substring(2, 6),
         clean: true,
         connectTimeout: 6000,
-        reconnectPeriod: 4000
+        reconnectPeriod: 3000
       });
 
       this.mqttClient.on('connect', () => {
@@ -1943,37 +1946,48 @@ const ApexCloud = {
           if (data && data.sender !== this.deviceId) {
             this.applyRemoteUpdate(data);
           }
-        } catch (e) {
-          console.warn('MQTT parse error:', e);
-        }
+        } catch (e) {}
       });
     } catch (e) {
-      console.warn('Live sync connection failed:', e);
+      console.warn('Live sync connect error:', e);
     }
   },
 
   broadcastMutation(key, value) {
     const syncKey = this.getSyncKey();
-    if (!syncKey || !this.mqttClient || !this.mqttClient.connected) return;
+    const payload = {
+      type: 'mutation',
+      sender: this.deviceId,
+      key: key,
+      value: value,
+      timestamp: Date.now()
+    };
 
-    try {
-      const topic = 'apexpulse/live/' + syncKey.trim();
-      const msg = JSON.stringify({
-        type: 'mutation',
-        sender: this.deviceId,
-        key: key,
-        value: value,
-        timestamp: Date.now()
-      });
-      this.mqttClient.publish(topic, msg);
-    } catch (e) {}
+    // 1. Broadcast to other tabs on same device
+    if (this.localChannel) {
+      try { this.localChannel.postMessage(payload); } catch(e){}
+    }
+
+    // 2. Broadcast to other devices over WebSockets
+    if (syncKey && this.mqttClient && this.mqttClient.connected) {
+      try {
+        const topic = 'apexpulse/live/' + syncKey.trim().toLowerCase();
+        this.mqttClient.publish(topic, JSON.stringify(payload));
+      } catch (e) {}
+    }
   },
 
   applyRemoteUpdate(data) {
     if (data.type === 'mutation' && data.key) {
       DB.set(data.key, data.value, true);
-      goTo(currentTab);
-      toast('⚡ Atualização recebida do outro dispositivo!', 'ok');
+      this.refreshCurrentView();
+      if (data.key === 'ap_nutrition') {
+        toast('⚡ Nutrição & Água atualizadas do outro dispositivo!', 'ok');
+      } else if (data.key === 'ap_workouts') {
+        toast('⚡ Treinos atualizados do outro dispositivo!', 'ok');
+      } else if (data.key === 'ap_metrics') {
+        toast('⚡ Peso & Métricas atualizadas!', 'ok');
+      }
     } else if (data.type === 'snapshot' && data.snapshot) {
       const d = data.snapshot;
       if (d.workouts) DB.set('ap_workouts', d.workouts, true);
@@ -1983,9 +1997,19 @@ const ApexCloud = {
       if (d.custom_foods) DB.set('ap_custom_foods', d.custom_foods, true);
       if (d.custom_exercises) DB.set('ap_custom_exercises', d.custom_exercises, true);
       if (d.custom_templates) DB.set('ap_custom_templates', d.custom_templates, true);
-      goTo(currentTab);
-      toast('⚡ Dados sincronizados em tempo real!', 'ok');
+      this.refreshCurrentView();
+      toast('⚡ Sincronizado com sucesso!', 'ok');
     }
+  },
+
+  refreshCurrentView() {
+    const mainEl = document.getElementById('main');
+    if (!mainEl) return;
+    if (currentTab === 'dashboard') renderDashboard(mainEl);
+    else if (currentTab === 'nutrition') renderNutrition(mainEl);
+    else if (currentTab === 'gym') renderGym(mainEl);
+    else if (currentTab === 'metrics') renderMetrics(mainEl);
+    else if (currentTab === 'settings') renderSettings(mainEl);
   },
 
   async push() {
@@ -2038,17 +2062,21 @@ const ApexCloud = {
     }
   },
 
-  async pullByKey(key) {
-    if (!key) throw new Error('Chave de sincronização em falta.');
+  async pullByKey(key, silent = false) {
+    if (!key) return;
     key = key.trim();
-    this.setSyncStatus('syncing');
+    if (!silent) this.setSyncStatus('syncing');
 
     try {
       const res = await fetch(`${this.ENDPOINT}/${key}`);
-      if (!res.ok) throw new Error('Chave não encontrada na nuvem. Confirma se digitaste corretamente.');
+      if (!res.ok) {
+        if (!silent) throw new Error('Chave não encontrada na nuvem.');
+        return;
+      }
       const data = await res.json();
 
-      if (data) {
+      if (data && (!this.lastRemoteUpdate || data.updatedAt > this.lastRemoteUpdate)) {
+        this.lastRemoteUpdate = data.updatedAt || Date.now();
         if (data.workouts) DB.set('ap_workouts', data.workouts, true);
         if (data.nutrition) DB.set('ap_nutrition', data.nutrition, true);
         if (data.metrics) DB.set('ap_metrics', data.metrics, true);
@@ -2069,13 +2097,14 @@ const ApexCloud = {
 
         this.setSyncStatus('synced');
         this.updateUI();
-        this.connectLive();
-        goTo(currentTab);
+        this.refreshCurrentView();
         return user;
       }
     } catch (e) {
-      this.setSyncStatus('offline');
-      throw e;
+      if (!silent) {
+        this.setSyncStatus('offline');
+        throw e;
+      }
     }
   },
 
@@ -2138,13 +2167,29 @@ const ApexCloud = {
       }
     }
 
+    if (this.localChannel) {
+      this.localChannel.onmessage = (e) => {
+        if (e.data && e.data.sender !== this.deviceId) {
+          this.applyRemoteUpdate(e.data);
+        }
+      };
+    }
+
     this.updateUI();
     this.connectLive();
+
+    // Fast polling fallback every 4 seconds to guarantee sync on mobile/background
+    setInterval(() => {
+      const key = this.getSyncKey();
+      if (key && navigator.onLine && !this.isSyncing) {
+        this.pullByKey(key, true);
+      }
+    }, 4000);
 
     window.addEventListener('focus', () => {
       const key = this.getSyncKey();
       if (key) {
-        this.pullByKey(key).catch(() => {});
+        this.pullByKey(key, true);
         this.connectLive();
       }
     });
