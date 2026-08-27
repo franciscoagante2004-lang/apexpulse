@@ -1814,6 +1814,8 @@ function obFinish(){
 // CLOUD AUTH & REAL-TIME SYNC (ApexCloud)
 // ===========================
 const ApexCloud = {
+  REGISTRY_ID: 'ff8081819ff5b11001a043f809f139d9',
+  API_BASE: 'https://api.restful-api.dev/objects',
   syncTimer: null,
   isSyncing: false,
 
@@ -1823,54 +1825,139 @@ const ApexCloud = {
 
   async hashPassword(email, password) {
     const encoder = new TextEncoder();
-    const data = encoder.encode(email.toLowerCase().trim() + '::' + password + '::apexpulse_cloud_salt_2026');
+    const data = encoder.encode(email.toLowerCase().trim() + '::' + password.trim() + '::apexpulse_cloud_salt_2026');
     const hashBuffer = await crypto.subtle.digest('SHA-256', data);
     const hashArray = Array.from(new Uint8Array(hashBuffer));
-    return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+    return 'u_' + hashArray.map(b => b.toString(16).padStart(2, '0')).join('').slice(0, 24);
   },
 
-  async getAccountKey(email, password) {
-    const hash = await this.hashPassword(email, password);
-    return 'apex_acc_' + hash.slice(0, 32);
+  async getRegistry() {
+    try {
+      const res = await fetch(`${this.API_BASE}/${this.REGISTRY_ID}`);
+      if (!res.ok) return {};
+      const json = await res.json();
+      return json.data || {};
+    } catch (e) {
+      console.warn('Error fetching registry:', e);
+      return {};
+    }
+  },
+
+  async updateRegistry(accKey, docId) {
+    try {
+      const current = await this.getRegistry();
+      current[accKey] = docId;
+      await fetch(`${this.API_BASE}/${this.REGISTRY_ID}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: 'APEXPULSE_GLOBAL_INDEX_V1',
+          data: current
+        })
+      });
+    } catch (e) {
+      console.warn('Error updating registry:', e);
+    }
   },
 
   async register(email, password, name) {
     email = email.toLowerCase().trim();
+    password = password.trim();
     if (!email || !password) throw new Error('Preenche o email e a palavra-passe.');
     if (password.length < 4) throw new Error('A palavra-passe deve ter pelo menos 4 caracteres.');
 
-    const accKey = await this.getAccountKey(email, password);
+    toast('A conectar à nuvem...', 'info');
+    const accKey = await this.hashPassword(email, password);
+    const registry = await this.getRegistry();
+
+    let docId = registry[accKey];
+
+    const payload = {
+      updatedAt: Date.now(),
+      profile: getProfile(),
+      workouts: DB.get('ap_workouts', []),
+      nutrition: DB.get('ap_nutrition', {}),
+      metrics: DB.get('ap_metrics', []),
+      custom_foods: DB.get('ap_custom_foods', []),
+      custom_exercises: DB.get('ap_custom_exercises', []),
+      custom_templates: DB.get('ap_custom_templates', [])
+    };
+    if (name) payload.profile.name = name;
+
+    if (docId) {
+      await fetch(`${this.API_BASE}/${docId}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: `ApexUser_${accKey}`, data: payload })
+      });
+    } else {
+      const res = await fetch(this.API_BASE, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: `ApexUser_${accKey}`, data: payload })
+      });
+      if (!res.ok) throw new Error('Falha ao criar o registo na nuvem.');
+      const json = await res.json();
+      docId = json.id;
+      await this.updateRegistry(accKey, docId);
+    }
+
     const user = {
       email,
-      name: name || email.split('@')[0],
+      name: name || payload.profile.name || email.split('@')[0],
       accKey,
+      docId,
       registeredAt: new Date().toISOString(),
       lastSync: new Date().toISOString()
     };
 
     DB.set('ap_cloud_user', user);
-    const profile = getProfile();
-    if (name) profile.name = name;
-    DB.set('ap_profile', profile);
+    if (name) {
+      const p = getProfile(); p.name = name; DB.set('ap_profile', p);
+    }
 
-    await this.push();
     this.updateUI();
     return user;
   },
 
   async login(email, password) {
     email = email.toLowerCase().trim();
+    password = password.trim();
     if (!email || !password) throw new Error('Preenche o email e a palavra-passe.');
 
-    const accKey = await this.getAccountKey(email, password);
+    toast('A procurar conta na nuvem...', 'info');
+    const accKey = await this.hashPassword(email, password);
+    const registry = await this.getRegistry();
+    const docId = registry[accKey];
+
+    if (!docId) {
+      throw new Error('Conta não encontrada com estes dados. Cria primeiro a conta na aba "Criar Nova Conta".');
+    }
+
+    const res = await fetch(`${this.API_BASE}/${docId}`);
+    if (!res.ok) throw new Error('Erro ao transferir dados da nuvem.');
+    const json = await res.json();
+    const cloudData = json.data;
+
+    if (cloudData) {
+      if (cloudData.workouts) DB.set('ap_workouts', cloudData.workouts);
+      if (cloudData.nutrition) DB.set('ap_nutrition', cloudData.nutrition);
+      if (cloudData.metrics) DB.set('ap_metrics', cloudData.metrics);
+      if (cloudData.profile) DB.set('ap_profile', cloudData.profile);
+      if (cloudData.custom_foods) DB.set('ap_custom_foods', cloudData.custom_foods);
+      if (cloudData.custom_exercises) DB.set('ap_custom_exercises', cloudData.custom_exercises);
+      if (cloudData.custom_templates) DB.set('ap_custom_templates', cloudData.custom_templates);
+    }
+
     const user = {
       email,
+      name: (cloudData && cloudData.profile && cloudData.profile.name) || email.split('@')[0],
       accKey,
+      docId,
       lastSync: new Date().toISOString()
     };
-    DB.set('ap_cloud_user', user);
 
-    await this.pull(true);
+    DB.set('ap_cloud_user', user);
     this.updateUI();
     return user;
   },
@@ -1883,7 +1970,7 @@ const ApexCloud = {
 
   async push() {
     const user = this.getUser();
-    if (!user || !user.accKey) return;
+    if (!user || !user.docId) return;
     if (this.isSyncing) return;
     this.isSyncing = true;
     this.setSyncStatus('syncing');
@@ -1900,25 +1987,19 @@ const ApexCloud = {
         custom_templates: DB.get('ap_custom_templates', [])
       };
 
-      // Store in cloud vault and mirror locally
-      localStorage.setItem('apex_cloud_cache_' + user.accKey, JSON.stringify(payload));
+      const res = await fetch(`${this.API_BASE}/${user.docId}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: `ApexUser_${user.accKey}`, data: payload })
+      });
 
-      // Asynchronous resilient cloud storage push
-      try {
-        await fetch(`https://api.jsonbin.io/v3/b`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'X-Bin-Private': 'true',
-            'X-Bin-Name': user.accKey
-          },
-          body: JSON.stringify(payload)
-        }).catch(()=>{});
-      } catch (err) {}
-
-      user.lastSync = new Date().toISOString();
-      DB.set('ap_cloud_user', user);
-      this.setSyncStatus('synced');
+      if (res.ok) {
+        user.lastSync = new Date().toISOString();
+        DB.set('ap_cloud_user', user);
+        this.setSyncStatus('synced');
+      } else {
+        this.setSyncStatus('offline');
+      }
     } catch (e) {
       console.warn('Sync push error:', e);
       this.setSyncStatus('offline');
@@ -1929,13 +2010,16 @@ const ApexCloud = {
 
   async pull(forceReload = false) {
     const user = this.getUser();
-    if (!user || !user.accKey) return;
+    if (!user || !user.docId) return;
     this.setSyncStatus('syncing');
 
     try {
-      const cached = localStorage.getItem('apex_cloud_cache_' + user.accKey);
-      if (cached) {
-        const d = JSON.parse(cached);
+      const res = await fetch(`${this.API_BASE}/${user.docId}`);
+      if (!res.ok) throw new Error('Cloud unreachable');
+      const json = await res.json();
+      const d = json.data;
+
+      if (d) {
         if (d.workouts) DB.set('ap_workouts', d.workouts);
         if (d.nutrition) DB.set('ap_nutrition', d.nutrition);
         if (d.metrics) DB.set('ap_metrics', d.metrics);
@@ -1943,15 +2027,14 @@ const ApexCloud = {
         if (d.custom_foods) DB.set('ap_custom_foods', d.custom_foods);
         if (d.custom_exercises) DB.set('ap_custom_exercises', d.custom_exercises);
         if (d.custom_templates) DB.set('ap_custom_templates', d.custom_templates);
-      }
 
-      user.lastSync = new Date().toISOString();
-      DB.set('ap_cloud_user', user);
-      this.setSyncStatus('synced');
+        user.lastSync = new Date().toISOString();
+        DB.set('ap_cloud_user', user);
+        this.setSyncStatus('synced');
 
-      if (forceReload) {
-        goTo(currentTab);
-        toast('Dados sincronizados da nuvem! ☁️', 'ok');
+        if (forceReload) {
+          goTo(currentTab);
+        }
       }
     } catch (e) {
       this.setSyncStatus('offline');
@@ -1992,15 +2075,23 @@ const ApexCloud = {
 
   init() {
     this.updateUI();
-    window.addEventListener('focus', () => this.pull());
+    window.addEventListener('focus', () => {
+      if (this.getUser()) this.pull(true);
+    });
     window.addEventListener('online', () => {
-      this.push();
-      toast('Ligação recuperada. Dados sincronizados com a nuvem! ☁️', 'ok');
+      if (this.getUser()) {
+        this.push();
+        toast('Ligação recuperada. Dados sincronizados com a nuvem! ☁️', 'ok');
+      }
     });
 
+    if (this.getUser()) {
+      this.pull(false);
+    }
+
     setInterval(() => {
-      if (this.getUser() && navigator.onLine) this.push();
-    }, 120000);
+      if (this.getUser() && navigator.onLine && !this.isSyncing) this.push();
+    }, 60000);
   }
 };
 
