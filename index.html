@@ -430,41 +430,57 @@ const DB = {
 };
 
 function initData() {
+  const isCleanSlate = localStorage.getItem('ap_clean_slate') === 'true';
+
   if (!DB.get('ap_workouts',null)) {
-    const workouts=[];
-    [1,3,5,8,10,12,15,17,19,22].forEach((dAgo,i)=>{
-      const d=new Date();d.setDate(d.getDate()-dAgo);
-      const ds=d.toISOString().split('T')[0];
-      const p=i*1.2;
-      const t=TEMPLATES[i%3];
-      const exercises=t.exercises.slice(0,4).map(eid=>{
-        const ex=EXERCISES.find(e=>e.id===eid);
-        const kg=eid==='squat'?100+p*1.8:eid==='bench'?70+p*1.5:eid==='deadlift'?120+p*2:eid.includes('curl')?28+p*0.5:40+p;
-        const r=eid==='squat'||eid==='deadlift'?6:8;
-        return {id:eid,name:ex?ex.name:eid,sets:[{n:1,kg:Math.round(kg*2)/2,reps:r,done:true},{n:2,kg:Math.round(kg*2)/2,reps:r,done:true},{n:3,kg:Math.round(kg*2)/2,reps:r-1,done:true}]};
+    if (isCleanSlate) {
+      DB.set('ap_workouts', []);
+    } else {
+      const workouts=[];
+      [1,3,5,8,10,12,15,17,19,22].forEach((dAgo,i)=>{
+        const d=new Date();d.setDate(d.getDate()-dAgo);
+        const ds=d.toISOString().split('T')[0];
+        const p=i*1.2;
+        const t=TEMPLATES[i%3];
+        const exercises=t.exercises.slice(0,4).map(eid=>{
+          const ex=EXERCISES.find(e=>e.id===eid);
+          const kg=eid==='squat'?100+p*1.8:eid==='bench'?70+p*1.5:eid==='deadlift'?120+p*2:eid.includes('curl')?28+p*0.5:40+p;
+          const r=eid==='squat'||eid==='deadlift'?6:8;
+          return {id:eid,name:ex?ex.name:eid,sets:[{n:1,kg:Math.round(kg*2)/2,reps:r,done:true},{n:2,kg:Math.round(kg*2)/2,reps:r,done:true},{n:3,kg:Math.round(kg*2)/2,reps:r-1,done:true}]};
+        });
+        workouts.push({id:'w'+i,name:t.name,date:ds,dur:60+i*2,exercises});
       });
-      workouts.push({id:'w'+i,name:t.name,date:ds,dur:60+i*2,exercises});
-    });
-    DB.set('ap_workouts',workouts);
-  }
-  if(!DB.get('ap_nutrition',null)){
-    const logs={};
-    for(let i=0;i<7;i++){
-      const d=new Date();d.setDate(d.getDate()-i);
-      const ds=d.toISOString().split('T')[0];
-      logs[ds]={water:2200+Math.round(Math.random()*800),meals:{
-        breakfast:[{fid:'f4',name:'Aveia em Flocos',qty:80,cal:311,prot:14,carb:53,fat:6},{fid:'f13',name:'Iogurte Grego',qty:150,cal:146,prot:14,carb:6,fat:8}],
-        lunch:[{fid:'f1',name:'Peito de Frango',qty:200,cal:330,prot:62,carb:0,fat:7},{fid:'f2',name:'Arroz Branco',qty:150,cal:195,prot:4,carb:42,fat:0}],
-        dinner:[{fid:'f6',name:'Salmão Grelhado',qty:180,cal:374,prot:36,carb:0,fat:23},{fid:'f7',name:'Batata Doce',qty:200,cal:172,prot:3,carb:40,fat:0}],
-        snacks:[{fid:'f5',name:'Whey Protein',qty:30,cal:120,prot:25,carb:3,fat:2}],
-      }};
+      DB.set('ap_workouts',workouts);
     }
-    DB.set('ap_nutrition',logs);
   }
+
+  if(!DB.get('ap_nutrition',null)){
+    if (isCleanSlate) {
+      DB.set('ap_nutrition', {});
+    } else {
+      const logs={};
+      for(let i=0;i<7;i++){
+        const d=new Date();d.setDate(d.getDate()-i);
+        const ds=d.toISOString().split('T')[0];
+        logs[ds]={water:2200+Math.round(Math.random()*800),meals:{
+          breakfast:[{fid:'f4',name:'Aveia em Flocos',qty:80,cal:311,prot:14,carb:53,fat:6},{fid:'f13',name:'Iogurte Grego',qty:150,cal:146,prot:14,carb:6,fat:8}],
+          lunch:[{fid:'f1',name:'Peito de Frango',qty:200,cal:330,prot:62,carb:0,fat:7},{fid:'f2',name:'Arroz Branco',qty:150,cal:195,prot:4,carb:42,fat:0}],
+          dinner:[{fid:'f6',name:'Salmão Grelhado',qty:180,cal:374,prot:36,carb:0,fat:23},{fid:'f7',name:'Batata Doce',qty:200,cal:172,prot:3,carb:40,fat:0}],
+          snacks:[{fid:'f5',name:'Whey Protein',qty:30,cal:120,prot:25,carb:3,fat:2}],
+        }};
+      }
+      DB.set('ap_nutrition',logs);
+    }
+  }
+
   if(!DB.get('ap_metrics',null)){
-    const m=[];
-    for(let i=30;i>=0;i-=2){const d=new Date();d.setDate(d.getDate()-i);m.push({date:d.toISOString().split('T')[0],weight:parseFloat((78.5+i*(-0.03)+(Math.random()*0.4-0.2)).toFixed(1)),bf:15.2});}
-    DB.set('ap_metrics',m);
+    if (isCleanSlate) {
+      DB.set('ap_metrics', []);
+    } else {
+      const m=[];
+      for(let i=30;i>=0;i-=2){const d=new Date();d.setDate(d.getDate()-i);m.push({date:d.toISOString().split('T')[0],weight:parseFloat((78.5+i*(-0.03)+(Math.random()*0.4-0.2)).toFixed(1)),bf:15.2});}
+      DB.set('ap_metrics',m);
+    }
   }
 }
 
@@ -1509,11 +1525,11 @@ function renderSettings(el){
     </div>
   </div>
   <div class="panel">
-    <div class="section-title">💾 Dados & Backup</div>
+    <div class="section-title">💾 Dados, Backup & Limpeza</div>
     <div class="flex gap2" style="flex-wrap:wrap">
       <button class="btn btn-secondary" onclick="exportBackup()">📥 Exportar JSON</button>
       <label class="btn btn-secondary" style="cursor:pointer">📤 Importar JSON<input type="file" accept=".json" style="display:none" onchange="importBackup(this)"></label>
-      <button class="btn btn-danger" onclick="resetData()">🗑 Repor Dados</button>
+      <button class="btn btn-danger" onclick="openClearDataModal()">🗑️ Apagar Dados / Começar do Zero</button>
     </div>
   </div>
 </div>`;
@@ -1551,7 +1567,71 @@ function importBackup(input){
   const f=input.files[0];if(!f)return;
   const r=new FileReader();r.onload=e=>{try{const d=JSON.parse(e.target.result);if(d.workouts)DB.set('ap_workouts',d.workouts);if(d.nutrition)DB.set('ap_nutrition',d.nutrition);if(d.metrics)DB.set('ap_metrics',d.metrics);if(d.profile)DB.set('ap_profile',d.profile);if(d.custom_foods)DB.set('ap_custom_foods',d.custom_foods);if(d.custom_exercises)DB.set('ap_custom_exercises',d.custom_exercises);if(d.custom_templates)DB.set('ap_custom_templates',d.custom_templates);toast('Importado! A recarregar...');setTimeout(()=>location.reload(),1000);}catch{toast('Erro ao importar','err');}};r.readAsText(f);
 }
-function resetData(){if(!confirm('Repor todos os dados?'))return;['ap_workouts','ap_nutrition','ap_metrics','ap_profile','ap_custom_foods','ap_custom_exercises','ap_custom_templates','ap_active_workout'].forEach(k=>localStorage.removeItem(k));toast('Dados repostos. A recarregar...');setTimeout(()=>location.reload(),800);}
+
+function openClearDataModal() {
+  openModal(`
+    <div style="display:flex;flex-direction:column;gap:14px">
+      <div class="flex justify-between items-center">
+        <div class="text-lg text-rose">🗑️ Apagar Dados & Limpeza</div>
+        <button class="btn btn-secondary btn-sm" onclick="closeModal()">✕</button>
+      </div>
+
+      <div class="text-xs text-muted">Escolhe o que desejas apagar. Podes limpar tudo para começar com a aplicação 100% vazia ou apagar apenas secções específicas:</div>
+
+      <div style="display:flex;flex-direction:column;gap:8px">
+        <button class="btn btn-danger w100" style="padding:12px;font-size:13px;justify-content:center;background:rgba(244,63,94,.18)" onclick="clearDataAction('all')">
+          💥 <strong>Apagar TUDO (Começar do Zero)</strong>
+        </button>
+        <div class="text-xs text-muted" style="text-align:center;margin-bottom:8px">Elimina todos os treinos, histórico de refeições, pesos e dados de exemplo.</div>
+
+        <button class="btn btn-secondary w100" style="padding:10px;justify-content:flex-start" onclick="clearDataAction('workouts')">
+          🏋️‍♂️ <strong>Limpar apenas Histórico de Treinos</strong>
+        </button>
+
+        <button class="btn btn-secondary w100" style="padding:10px;justify-content:flex-start" onclick="clearDataAction('nutrition')">
+          🥗 <strong>Limpar apenas Diário de Nutrição & Calorias</strong>
+        </button>
+
+        <button class="btn btn-secondary w100" style="padding:10px;justify-content:flex-start" onclick="clearDataAction('metrics')">
+          ⚖️ <strong>Limpar apenas Histórico de Peso & Métricas</strong>
+        </button>
+      </div>
+    </div>
+  `);
+}
+
+function clearDataAction(mode) {
+  if (mode === 'all') {
+    if (!confirm('Tens a certeza de que queres APAGAR TODOS OS DADOS e começar do absoluto zero?')) return;
+    localStorage.clear();
+    localStorage.setItem('ap_clean_slate', 'true');
+    DB.set('ap_workouts', []);
+    DB.set('ap_nutrition', {});
+    DB.set('ap_metrics', []);
+    DB.set('ap_profile', { name: 'Atleta', calTarget: 2500, protTarget: 160, carbTarget: 280, fatTarget: 70, waterTarget: 3000, goal: 'Hipertrofia', _setup: true });
+    closeModal();
+    toast('Todos os dados foram apagados! Aplicação limpa a 100%. ✨', 'ok');
+    setTimeout(() => goTo('dashboard'), 200);
+  } else if (mode === 'workouts') {
+    if (!confirm('Eliminar todo o histórico de treinos?')) return;
+    DB.set('ap_workouts', []);
+    closeModal();
+    toast('Histórico de treinos limpo!', 'ok');
+    goTo('gym');
+  } else if (mode === 'nutrition') {
+    if (!confirm('Eliminar todo o registo de calorias e refeições?')) return;
+    DB.set('ap_nutrition', {});
+    closeModal();
+    toast('Registo de nutrição limpo!', 'ok');
+    goTo('nutrition');
+  } else if (mode === 'metrics') {
+    if (!confirm('Eliminar todo o histórico de peso?')) return;
+    DB.set('ap_metrics', []);
+    closeModal();
+    toast('Histórico de peso limpo!', 'ok');
+    goTo('metrics');
+  }
+}
 
 // ===========================
 // TDEE CALCULATOR (shared)
