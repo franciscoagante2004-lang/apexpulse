@@ -1893,10 +1893,10 @@ function obFinish(){
 }
 
 // ===========================
-// CLOUD AUTH & REAL-TIME SYNC (ApexCloud Room Engine)
+// CLOUD AUTH & REAL-TIME SYNC (ApexCloud Room Engine v3 - Bytebin + MQTT)
 // ===========================
 const ApexCloud = {
-  API_BASE: 'https://api.restful-api.dev/objects',
+  API_BASE: 'https://bytebin.lucko.me',
   deviceId: localStorage.getItem('apex_device_id') || (() => {
     const id = 'dev_' + Math.random().toString(36).substring(2, 9);
     localStorage.setItem('apex_device_id', id);
@@ -1904,9 +1904,9 @@ const ApexCloud = {
   })(),
   mqttClient: null,
   localChannel: typeof BroadcastChannel !== 'undefined' ? new BroadcastChannel('apexpulse_live_bus') : null,
-  syncTimer: null,
   isSyncing: false,
   lastRemoteUpdate: 0,
+  pushTimeout: null,
 
   getRoomId() {
     return localStorage.getItem('apex_room_id') || '';
@@ -1917,7 +1917,6 @@ const ApexCloud = {
       localStorage.setItem('apex_room_id', id.trim());
       const user = DB.get('ap_cloud_user', {}) || {};
       user.roomId = id.trim();
-      user.syncKey = id.trim();
       DB.set('ap_cloud_user', user, true);
     } else {
       localStorage.removeItem('apex_room_id');
@@ -1929,6 +1928,7 @@ const ApexCloud = {
     const roomId = this.getRoomId();
     if (!roomId || typeof mqtt === 'undefined') return;
 
+    if (this.mqttClient && this.mqttClient.connected) return;
     if (this.mqttClient) {
       try { this.mqttClient.end(true); } catch (e) {}
     }
@@ -1947,10 +1947,18 @@ const ApexCloud = {
         this.setSyncStatus('synced');
       });
 
-      this.mqttClient.on('message', (t, message) => {
+      this.mqttClient.on('message', async (t, message) => {
         try {
           const data = JSON.parse(message.toString());
-          if (data && data.sender !== this.deviceId) {
+          
+          // 1. Snapshot pointer received (usually right after connecting due to retained message)
+          if (data.type === 'snapshot_pointer' && data.key) {
+            if (data.sender !== this.deviceId && (!this.lastRemoteUpdate || data.timestamp > this.lastRemoteUpdate)) {
+              await this.pullSnapshot(data.key);
+            }
+          } 
+          // 2. Real-time individual mutation
+          else if (data.type === 'mutation' && data.sender !== this.deviceId) {
             this.applyRemoteUpdate(data);
           }
         } catch (e) {}
@@ -1982,6 +1990,14 @@ const ApexCloud = {
         this.mqttClient.publish(topic, JSON.stringify(payload));
       } catch (e) {}
     }
+
+    // 3. Debounce a full snapshot push to bytebin to keep data safely stored
+    if (roomId) {
+      if (this.pushTimeout) clearTimeout(this.pushTimeout);
+      this.pushTimeout = setTimeout(() => {
+        this.pushSnapshot();
+      }, 5000);
+    }
   },
 
   applyRemoteUpdate(data) {
@@ -1995,17 +2011,6 @@ const ApexCloud = {
       } else if (data.key === 'ap_metrics') {
         toast('⚡ Peso sincronizado em tempo real!', 'ok');
       }
-    } else if (data.type === 'snapshot' && data.data) {
-      const d = data.data;
-      if (d.workouts) DB.set('ap_workouts', d.workouts, true);
-      if (d.nutrition) DB.set('ap_nutrition', d.nutrition, true);
-      if (d.metrics) DB.set('ap_metrics', d.metrics, true);
-      if (d.profile) DB.set('ap_profile', d.profile, true);
-      if (d.custom_foods) DB.set('ap_custom_foods', d.custom_foods, true);
-      if (d.custom_exercises) DB.set('ap_custom_exercises', d.custom_exercises, true);
-      if (d.custom_templates) DB.set('ap_custom_templates', d.custom_templates, true);
-      this.refreshCurrentView();
-      toast('⚡ Dados sincronizados em tempo real!', 'ok');
     }
   },
 
@@ -2019,13 +2024,18 @@ const ApexCloud = {
     else if (currentTab === 'settings') renderSettings(mainEl);
   },
 
-  async createOrPushRoom() {
+  async pushSnapshot(forceNewRoom = false) {
     if (this.isSyncing) return this.getRoomId();
     this.isSyncing = true;
     this.setSyncStatus('syncing');
 
     try {
-      let roomId = this.getRoomId();
+      let roomId = forceNewRoom ? '' : this.getRoomId();
+      if (!roomId) {
+        roomId = 'rm_' + Math.random().toString(36).substring(2, 10);
+        this.setRoomId(roomId);
+      }
+
       const payload = {
         updatedAt: Date.now(),
         profile: getProfile(),
@@ -2037,29 +2047,33 @@ const ApexCloud = {
         custom_templates: DB.get('ap_custom_templates', [])
       };
 
-      if (roomId) {
-        // Update existing permanent room
-        await fetch(`${this.API_BASE}/${roomId}`, {
-          method: 'PUT',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ name: 'APEX_PULSE_ROOM', data: payload })
-        });
-      } else {
-        // Create new permanent room
-        const res = await fetch(this.API_BASE, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ name: 'APEX_PULSE_ROOM', data: payload })
-        });
-        if (!res.ok) throw new Error('Falha ao criar sala na nuvem');
-        const json = await res.json();
-        roomId = json.id;
-        this.setRoomId(roomId);
+      // 1. Post blob to bytebin
+      const res = await fetch(`${this.API_BASE}/post`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      if (!res.ok) throw new Error('Falha ao enviar snapshot para a nuvem');
+      const json = await res.json();
+      const bytebinKey = json.key;
+
+      // 2. Publish retained pointer to MQTT
+      if (this.mqttClient && this.mqttClient.connected) {
+        const topic = 'apexpulse/room/' + roomId.trim().toLowerCase();
+        const pointer = {
+          type: 'snapshot_pointer',
+          sender: this.deviceId,
+          key: bytebinKey,
+          timestamp: payload.updatedAt
+        };
+        // retain: true makes the MQTT broker save this message and send it instantly to anyone who joins the room later!
+        this.mqttClient.publish(topic, JSON.stringify(pointer), { retain: true });
       }
 
       this.setSyncStatus('synced');
       this.updateUI();
-      this.connectLive();
+      if (!this.mqttClient || !this.mqttClient.connected) this.connectLive();
+      
       return roomId;
     } catch (e) {
       console.warn('Sync push error:', e);
@@ -2070,19 +2084,17 @@ const ApexCloud = {
     }
   },
 
-  async pullFromRoom(roomId, silent = false) {
-    if (!roomId) return;
-    roomId = roomId.trim();
+  async pullSnapshot(bytebinKey, silent = false) {
+    if (!bytebinKey) return;
     if (!silent) this.setSyncStatus('syncing');
 
     try {
-      const res = await fetch(`${this.API_BASE}/${roomId}`);
+      const res = await fetch(`${this.API_BASE}/${bytebinKey}`);
       if (!res.ok) {
-        if (!silent) throw new Error('Sala de sincronização não encontrada.');
+        if (!silent) throw new Error('Dados da nuvem expiraram ou não encontrados.');
         return;
       }
-      const json = await res.json();
-      const data = json.data;
+      const data = await res.json();
 
       if (data && (!this.lastRemoteUpdate || data.updatedAt > this.lastRemoteUpdate)) {
         this.lastRemoteUpdate = data.updatedAt || Date.now();
@@ -2094,10 +2106,11 @@ const ApexCloud = {
         if (data.custom_exercises) DB.set('ap_custom_exercises', data.custom_exercises, true);
         if (data.custom_templates) DB.set('ap_custom_templates', data.custom_templates, true);
 
-        this.setRoomId(roomId);
         this.setSyncStatus('synced');
         this.updateUI();
         this.refreshCurrentView();
+        
+        if (!silent) toast('⚡ Sincronização concluída com sucesso!', 'ok');
         return data;
       }
     } catch (e) {
@@ -2106,6 +2119,13 @@ const ApexCloud = {
         throw e;
       }
     }
+  },
+
+  joinRoom(roomId) {
+    this.setRoomId(roomId);
+    this.connectLive();
+    // The MQTT client will receive the retained 'snapshot_pointer' message immediately upon connecting
+    // and will automatically trigger pullSnapshot().
   },
 
   logout() {
@@ -2153,17 +2173,11 @@ const ApexCloud = {
     if (hash && (hash.includes('room=') || hash.includes('sync='))) {
       const key = (hash.includes('room=') ? hash.split('room=')[1] : hash.split('sync=')[1]).split('&')[0];
       if (key) {
-        setTimeout(async () => {
-          try {
-            await this.pullFromRoom(key);
-            this.setRoomId(key);
-            this.connectLive();
-            toast('Dispositivo conectado e sincronizado com sucesso! 🎉', 'ok');
-            history.replaceState(null, null, ' ');
-          } catch (e) {
-            toast('Erro ao ligar à sala de sincronização', 'err');
-          }
-        }, 200);
+        setTimeout(() => {
+          this.joinRoom(key);
+          toast('A conectar à sala... A aguardar dados! ⚡', 'info');
+          history.replaceState(null, null, ' ');
+        }, 300);
       }
     }
 
@@ -2178,26 +2192,12 @@ const ApexCloud = {
     this.updateUI();
     this.connectLive();
 
-    // Fast polling fallback every 3 seconds to guarantee 100% sync
-    setInterval(() => {
-      const roomId = this.getRoomId();
-      if (roomId && navigator.onLine && !this.isSyncing) {
-        this.pullFromRoom(roomId, true);
-      }
-    }, 3000);
-
     window.addEventListener('focus', () => {
-      const roomId = this.getRoomId();
-      if (roomId) {
-        this.pullFromRoom(roomId, true);
-        this.connectLive();
-      }
+      if (this.getRoomId()) this.connectLive();
     });
 
     window.addEventListener('online', () => {
-      this.connectLive();
-      const roomId = this.getRoomId();
-      if (roomId) this.createOrPushRoom().catch(() => {});
+      if (this.getRoomId()) this.connectLive();
     });
   }
 };
@@ -2224,7 +2224,7 @@ function openAuthModal(tab = 'pair') {
           <div class="text-xs text-muted">Cria ou atualiza a tua sala na nuvem para sincronizar instantaneamente com o telemóvel:</div>
           
           <button class="btn btn-primary w100" id="btn-gen-cloud" onclick="handleGenerateCloudRoom()">
-            ☁️ ${currentRoom ? '🔄 Atualizar Sala na Nuvem' : '✨ Criar Sala de Sincronização'}
+            ☁️ ${currentRoom ? '🔄 Forçar Sincronização / Atualizar Sala' : '✨ Criar Sala de Sincronização'}
           </button>
 
           <div id="cloud-key-box" style="${currentRoom ? 'display:flex' : 'display:none'};flex-direction:column;gap:10px;background:var(--card);border:1px solid var(--green);border-radius:8px;padding:14px;align-items:center;text-align:center">
@@ -2269,11 +2269,12 @@ function openAuthModal(tab = 'pair') {
 
 async function handleGenerateCloudRoom() {
   const btn = document.getElementById('btn-gen-cloud');
-  if (btn) { btn.disabled = true; btn.textContent = '⏳ A conectar à nuvem...'; }
+  if (btn) { btn.disabled = true; btn.textContent = '⏳ A criar sala na nuvem...'; }
 
   try {
-    const roomId = await ApexCloud.createOrPushRoom();
-    toast('Sala ativa e sincronizada! ☁️', 'ok');
+    const isNew = !ApexCloud.getRoomId();
+    await ApexCloud.pushSnapshot(isNew);
+    toast('Sala ativa e dados sincronizados! ☁️', 'ok');
     openAuthModal('pair');
   } catch (err) {
     toast('Erro ao ligar à nuvem. Tenta novamente.', 'err');
@@ -2281,7 +2282,7 @@ async function handleGenerateCloudRoom() {
   }
 }
 
-async function handleConnectRoom() {
+function handleConnectRoom() {
   const input = document.getElementById('input-sync-key');
   let val = (input ? input.value : '').trim();
 
@@ -2293,15 +2294,9 @@ async function handleConnectRoom() {
   if (val.includes('room=')) val = val.split('room=')[1].split('&')[0];
   if (val.includes('sync=')) val = val.split('sync=')[1].split('&')[0];
 
-  toast('A conectar à sala...', 'info');
-  try {
-    await ApexCloud.pullFromRoom(val);
-    ApexCloud.connectLive();
-    toast('Conectado à sala! Sincronização em tempo real ativa ⚡', 'ok');
-    closeModal();
-  } catch (err) {
-    toast(err.message || 'ID de sala inválido.', 'err');
-  }
+  ApexCloud.joinRoom(val);
+  toast('A ligar à sala... ⚡', 'info');
+  closeModal();
 }
 
 // ===========================
