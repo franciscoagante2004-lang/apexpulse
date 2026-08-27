@@ -9,6 +9,7 @@
 <meta name="apple-mobile-web-app-capable" content="yes"/>
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent"/>
 <link rel="apple-touch-icon" href="icons/apple-touch-icon.png"/>
+<script src="https://cdn.jsdelivr.net/npm/mqtt/dist/mqtt.min.js"></script>
 <style>
 /* Onboarding */
 .ob-backdrop{position:fixed;inset:0;background:var(--bg);z-index:9999;display:flex;align-items:center;justify-content:center;padding:16px}
@@ -414,16 +415,17 @@ const FOODS = [
 ];
 
 // ===========================
-// DATA LAYER WITH CLOUD SYNC
+// DATA LAYER WITH REAL-TIME CLOUD SYNC
 // ===========================
 const DB = {
   get(k,d){try{const v=localStorage.getItem(k);return v?JSON.parse(v):d}catch{return d}},
-  set(k,v){
+  set(k,v,skipBroadcast=false){
     try{
       localStorage.setItem(k,JSON.stringify(v));
-      if(window.ApexCloud && ApexCloud.getUser()){
+      if(!skipBroadcast && window.ApexCloud){
+        ApexCloud.broadcastMutation(k, v);
         clearTimeout(ApexCloud.syncTimer);
-        ApexCloud.syncTimer = setTimeout(()=>ApexCloud.push(), 750);
+        ApexCloud.syncTimer = setTimeout(()=>ApexCloud.push(), 1500);
       }
     }catch{}
   },
@@ -1891,15 +1893,99 @@ function obFinish(){
 }
 
 // ===========================
-// CLOUD AUTH & REAL-TIME SYNC (ApexCloud)
+// CLOUD AUTH & REAL-TIME SYNC (ApexCloud Live)
 // ===========================
 const ApexCloud = {
   ENDPOINT: 'https://bytebin.lucko.me',
+  deviceId: localStorage.getItem('apex_device_id') || (() => {
+    const id = 'dev_' + Math.random().toString(36).substring(2, 9);
+    localStorage.setItem('apex_device_id', id);
+    return id;
+  })(),
+  mqttClient: null,
   syncTimer: null,
   isSyncing: false,
 
   getUser() {
     return DB.get('ap_cloud_user', null);
+  },
+
+  getSyncKey() {
+    const user = this.getUser();
+    return (user && user.syncKey) || localStorage.getItem('apex_last_synckey') || '';
+  },
+
+  connectLive() {
+    const key = this.getSyncKey();
+    if (!key || typeof mqtt === 'undefined') return;
+
+    if (this.mqttClient) {
+      try { this.mqttClient.end(true); } catch (e) {}
+    }
+
+    try {
+      const topic = 'apexpulse/live/' + key.trim();
+      this.mqttClient = mqtt.connect('wss://broker.hivemq.com:8884/mqtt', {
+        clientId: 'apex_' + this.deviceId + '_' + Math.random().toString(16).substring(2, 6),
+        clean: true,
+        connectTimeout: 6000,
+        reconnectPeriod: 4000
+      });
+
+      this.mqttClient.on('connect', () => {
+        this.mqttClient.subscribe(topic);
+        this.setSyncStatus('synced');
+      });
+
+      this.mqttClient.on('message', (t, message) => {
+        try {
+          const data = JSON.parse(message.toString());
+          if (data && data.sender !== this.deviceId) {
+            this.applyRemoteUpdate(data);
+          }
+        } catch (e) {
+          console.warn('MQTT parse error:', e);
+        }
+      });
+    } catch (e) {
+      console.warn('Live sync connection failed:', e);
+    }
+  },
+
+  broadcastMutation(key, value) {
+    const syncKey = this.getSyncKey();
+    if (!syncKey || !this.mqttClient || !this.mqttClient.connected) return;
+
+    try {
+      const topic = 'apexpulse/live/' + syncKey.trim();
+      const msg = JSON.stringify({
+        type: 'mutation',
+        sender: this.deviceId,
+        key: key,
+        value: value,
+        timestamp: Date.now()
+      });
+      this.mqttClient.publish(topic, msg);
+    } catch (e) {}
+  },
+
+  applyRemoteUpdate(data) {
+    if (data.type === 'mutation' && data.key) {
+      DB.set(data.key, data.value, true);
+      goTo(currentTab);
+      toast('⚡ Atualização recebida do outro dispositivo!', 'ok');
+    } else if (data.type === 'snapshot' && data.snapshot) {
+      const d = data.snapshot;
+      if (d.workouts) DB.set('ap_workouts', d.workouts, true);
+      if (d.nutrition) DB.set('ap_nutrition', d.nutrition, true);
+      if (d.metrics) DB.set('ap_metrics', d.metrics, true);
+      if (d.profile) DB.set('ap_profile', d.profile, true);
+      if (d.custom_foods) DB.set('ap_custom_foods', d.custom_foods, true);
+      if (d.custom_exercises) DB.set('ap_custom_exercises', d.custom_exercises, true);
+      if (d.custom_templates) DB.set('ap_custom_templates', d.custom_templates, true);
+      goTo(currentTab);
+      toast('⚡ Dados sincronizados em tempo real!', 'ok');
+    }
   },
 
   async push() {
@@ -1936,11 +2022,12 @@ const ApexCloud = {
 
       user.syncKey = key;
       user.lastSync = new Date().toISOString();
-      DB.set('ap_cloud_user', user);
+      DB.set('ap_cloud_user', user, true);
       localStorage.setItem('apex_last_synckey', key);
 
       this.setSyncStatus('synced');
       this.updateUI();
+      this.connectLive();
       return key;
     } catch (e) {
       console.warn('Sync push error:', e);
@@ -1962,13 +2049,13 @@ const ApexCloud = {
       const data = await res.json();
 
       if (data) {
-        if (data.workouts) DB.set('ap_workouts', data.workouts);
-        if (data.nutrition) DB.set('ap_nutrition', data.nutrition);
-        if (data.metrics) DB.set('ap_metrics', data.metrics);
-        if (data.profile) DB.set('ap_profile', data.profile);
-        if (data.custom_foods) DB.set('ap_custom_foods', data.custom_foods);
-        if (data.custom_exercises) DB.set('ap_custom_exercises', data.custom_exercises);
-        if (data.custom_templates) DB.set('ap_custom_templates', data.custom_templates);
+        if (data.workouts) DB.set('ap_workouts', data.workouts, true);
+        if (data.nutrition) DB.set('ap_nutrition', data.nutrition, true);
+        if (data.metrics) DB.set('ap_metrics', data.metrics, true);
+        if (data.profile) DB.set('ap_profile', data.profile, true);
+        if (data.custom_foods) DB.set('ap_custom_foods', data.custom_foods, true);
+        if (data.custom_exercises) DB.set('ap_custom_exercises', data.custom_exercises, true);
+        if (data.custom_templates) DB.set('ap_custom_templates', data.custom_templates, true);
 
         const user = {
           email: data.userEmail || '',
@@ -1977,11 +2064,12 @@ const ApexCloud = {
           lastSync: new Date().toISOString()
         };
 
-        DB.set('ap_cloud_user', user);
+        DB.set('ap_cloud_user', user, true);
         localStorage.setItem('apex_last_synckey', key);
 
         this.setSyncStatus('synced');
         this.updateUI();
+        this.connectLive();
         goTo(currentTab);
         return user;
       }
@@ -1992,7 +2080,11 @@ const ApexCloud = {
   },
 
   logout() {
-    DB.set('ap_cloud_user', null);
+    if (this.mqttClient) {
+      try { this.mqttClient.end(true); } catch (e) {}
+    }
+    DB.set('ap_cloud_user', null, true);
+    localStorage.removeItem('apex_last_synckey');
     this.updateUI();
     toast('Sessão terminada neste dispositivo.', 'info');
   },
@@ -2003,9 +2095,9 @@ const ApexCloud = {
     const topBadge = document.getElementById('top-cloud-badge');
 
     if (status === 'synced') {
-      if (dot) { dot.style.background = '#10b981'; dot.title = 'Sincronizado na Nuvem'; }
-      if (sub) sub.innerHTML = '<span style="color:#10b981">☁️ Sincronizado</span>';
-      if (topBadge) topBadge.innerHTML = '🟢 Nuvem Ativa';
+      if (dot) { dot.style.background = '#10b981'; dot.title = 'Sincronizado na Nuvem (Tempo Real Ativo)'; }
+      if (sub) sub.innerHTML = '<span style="color:#10b981">⚡ Nuvem em Tempo Real</span>';
+      if (topBadge) topBadge.innerHTML = '⚡ Sincronizado';
     } else if (status === 'syncing') {
       if (dot) { dot.style.background = '#f59e0b'; dot.title = 'A sincronizar...'; }
       if (sub) sub.innerHTML = '<span style="color:#f59e0b">🔄 A sincronizar...</span>';
@@ -2026,11 +2118,10 @@ const ApexCloud = {
     const p = getProfile();
     const nameEl = document.getElementById('sidebar-name');
     if (nameEl) nameEl.textContent = user ? (user.name || p.name || 'Atleta') : (p.name || 'Atleta');
-    this.setSyncStatus(user && user.syncKey ? 'synced' : 'none');
+    this.setSyncStatus(this.getSyncKey() ? 'synced' : 'none');
   },
 
   init() {
-    // Check URL hash for automatic pairing (e.g., #sync=KEY)
     const hash = window.location.hash;
     if (hash && hash.includes('sync=')) {
       const key = hash.split('sync=')[1].split('&')[0];
@@ -2048,6 +2139,21 @@ const ApexCloud = {
     }
 
     this.updateUI();
+    this.connectLive();
+
+    window.addEventListener('focus', () => {
+      const key = this.getSyncKey();
+      if (key) {
+        this.pullByKey(key).catch(() => {});
+        this.connectLive();
+      }
+    });
+
+    window.addEventListener('online', () => {
+      this.connectLive();
+      const key = this.getSyncKey();
+      if (key) this.push().catch(() => {});
+    });
   }
 };
 
