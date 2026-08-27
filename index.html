@@ -1893,10 +1893,10 @@ function obFinish(){
 }
 
 // ===========================
-// CLOUD AUTH & REAL-TIME SYNC (ApexCloud Live)
+// CLOUD AUTH & REAL-TIME SYNC (ApexCloud Room Engine)
 // ===========================
 const ApexCloud = {
-  ENDPOINT: 'https://bytebin.lucko.me',
+  API_BASE: 'https://api.restful-api.dev/objects',
   deviceId: localStorage.getItem('apex_device_id') || (() => {
     const id = 'dev_' + Math.random().toString(36).substring(2, 9);
     localStorage.setItem('apex_device_id', id);
@@ -1908,26 +1908,33 @@ const ApexCloud = {
   isSyncing: false,
   lastRemoteUpdate: 0,
 
-  getUser() {
-    return DB.get('ap_cloud_user', null);
+  getRoomId() {
+    return localStorage.getItem('apex_room_id') || '';
   },
 
-  getSyncKey() {
-    const user = this.getUser();
-    return (user && user.syncKey) || localStorage.getItem('apex_last_synckey') || '';
+  setRoomId(id) {
+    if (id) {
+      localStorage.setItem('apex_room_id', id.trim());
+      const user = DB.get('ap_cloud_user', {}) || {};
+      user.roomId = id.trim();
+      user.syncKey = id.trim();
+      DB.set('ap_cloud_user', user, true);
+    } else {
+      localStorage.removeItem('apex_room_id');
+      DB.set('ap_cloud_user', null, true);
+    }
   },
 
   connectLive() {
-    const key = this.getSyncKey();
-    if (!key || typeof mqtt === 'undefined') return;
+    const roomId = this.getRoomId();
+    if (!roomId || typeof mqtt === 'undefined') return;
 
     if (this.mqttClient) {
       try { this.mqttClient.end(true); } catch (e) {}
     }
 
     try {
-      const cleanKey = key.trim().toLowerCase();
-      const topic = 'apexpulse/live/' + cleanKey;
+      const topic = 'apexpulse/room/' + roomId.trim().toLowerCase();
       this.mqttClient = mqtt.connect('wss://broker.hivemq.com:8884/mqtt', {
         clientId: 'apex_' + this.deviceId + '_' + Math.random().toString(16).substring(2, 6),
         clean: true,
@@ -1954,7 +1961,7 @@ const ApexCloud = {
   },
 
   broadcastMutation(key, value) {
-    const syncKey = this.getSyncKey();
+    const roomId = this.getRoomId();
     const payload = {
       type: 'mutation',
       sender: this.deviceId,
@@ -1963,15 +1970,15 @@ const ApexCloud = {
       timestamp: Date.now()
     };
 
-    // 1. Broadcast to other tabs on same device
+    // 1. Local tabs
     if (this.localChannel) {
       try { this.localChannel.postMessage(payload); } catch(e){}
     }
 
-    // 2. Broadcast to other devices over WebSockets
-    if (syncKey && this.mqttClient && this.mqttClient.connected) {
+    // 2. Remote devices via WebSocket
+    if (roomId && this.mqttClient && this.mqttClient.connected) {
       try {
-        const topic = 'apexpulse/live/' + syncKey.trim().toLowerCase();
+        const topic = 'apexpulse/room/' + roomId.trim().toLowerCase();
         this.mqttClient.publish(topic, JSON.stringify(payload));
       } catch (e) {}
     }
@@ -1982,14 +1989,14 @@ const ApexCloud = {
       DB.set(data.key, data.value, true);
       this.refreshCurrentView();
       if (data.key === 'ap_nutrition') {
-        toast('⚡ Nutrição & Água atualizadas do outro dispositivo!', 'ok');
+        toast('⚡ Água / Calorias sincronizadas em tempo real!', 'ok');
       } else if (data.key === 'ap_workouts') {
-        toast('⚡ Treinos atualizados do outro dispositivo!', 'ok');
+        toast('⚡ Treinos sincronizados em tempo real!', 'ok');
       } else if (data.key === 'ap_metrics') {
-        toast('⚡ Peso & Métricas atualizadas!', 'ok');
+        toast('⚡ Peso sincronizado em tempo real!', 'ok');
       }
-    } else if (data.type === 'snapshot' && data.snapshot) {
-      const d = data.snapshot;
+    } else if (data.type === 'snapshot' && data.data) {
+      const d = data.data;
       if (d.workouts) DB.set('ap_workouts', d.workouts, true);
       if (d.nutrition) DB.set('ap_nutrition', d.nutrition, true);
       if (d.metrics) DB.set('ap_metrics', d.metrics, true);
@@ -1998,7 +2005,7 @@ const ApexCloud = {
       if (d.custom_exercises) DB.set('ap_custom_exercises', d.custom_exercises, true);
       if (d.custom_templates) DB.set('ap_custom_templates', d.custom_templates, true);
       this.refreshCurrentView();
-      toast('⚡ Sincronizado com sucesso!', 'ok');
+      toast('⚡ Dados sincronizados em tempo real!', 'ok');
     }
   },
 
@@ -2012,18 +2019,14 @@ const ApexCloud = {
     else if (currentTab === 'settings') renderSettings(mainEl);
   },
 
-  async push() {
-    if (this.isSyncing) return null;
+  async createOrPushRoom() {
+    if (this.isSyncing) return this.getRoomId();
     this.isSyncing = true;
     this.setSyncStatus('syncing');
 
     try {
-      const user = this.getUser() || {};
+      let roomId = this.getRoomId();
       const payload = {
-        app: 'ApexPulse Pro',
-        version: '1.0.0',
-        userEmail: user.email || '',
-        userName: user.name || getProfile().name || 'Atleta',
         updatedAt: Date.now(),
         profile: getProfile(),
         workouts: DB.get('ap_workouts', []),
@@ -2034,25 +2037,30 @@ const ApexCloud = {
         custom_templates: DB.get('ap_custom_templates', [])
       };
 
-      const res = await fetch(`${this.ENDPOINT}/post`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
-      });
-
-      if (!res.ok) throw new Error('Falha ao enviar para a nuvem');
-      const json = await res.json();
-      const key = json.key;
-
-      user.syncKey = key;
-      user.lastSync = new Date().toISOString();
-      DB.set('ap_cloud_user', user, true);
-      localStorage.setItem('apex_last_synckey', key);
+      if (roomId) {
+        // Update existing permanent room
+        await fetch(`${this.API_BASE}/${roomId}`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name: 'APEX_PULSE_ROOM', data: payload })
+        });
+      } else {
+        // Create new permanent room
+        const res = await fetch(this.API_BASE, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name: 'APEX_PULSE_ROOM', data: payload })
+        });
+        if (!res.ok) throw new Error('Falha ao criar sala na nuvem');
+        const json = await res.json();
+        roomId = json.id;
+        this.setRoomId(roomId);
+      }
 
       this.setSyncStatus('synced');
       this.updateUI();
       this.connectLive();
-      return key;
+      return roomId;
     } catch (e) {
       console.warn('Sync push error:', e);
       this.setSyncStatus('offline');
@@ -2062,18 +2070,19 @@ const ApexCloud = {
     }
   },
 
-  async pullByKey(key, silent = false) {
-    if (!key) return;
-    key = key.trim();
+  async pullFromRoom(roomId, silent = false) {
+    if (!roomId) return;
+    roomId = roomId.trim();
     if (!silent) this.setSyncStatus('syncing');
 
     try {
-      const res = await fetch(`${this.ENDPOINT}/${key}`);
+      const res = await fetch(`${this.API_BASE}/${roomId}`);
       if (!res.ok) {
-        if (!silent) throw new Error('Chave não encontrada na nuvem.');
+        if (!silent) throw new Error('Sala de sincronização não encontrada.');
         return;
       }
-      const data = await res.json();
+      const json = await res.json();
+      const data = json.data;
 
       if (data && (!this.lastRemoteUpdate || data.updatedAt > this.lastRemoteUpdate)) {
         this.lastRemoteUpdate = data.updatedAt || Date.now();
@@ -2085,20 +2094,11 @@ const ApexCloud = {
         if (data.custom_exercises) DB.set('ap_custom_exercises', data.custom_exercises, true);
         if (data.custom_templates) DB.set('ap_custom_templates', data.custom_templates, true);
 
-        const user = {
-          email: data.userEmail || '',
-          name: data.userName || (data.profile && data.profile.name) || 'Atleta',
-          syncKey: key,
-          lastSync: new Date().toISOString()
-        };
-
-        DB.set('ap_cloud_user', user, true);
-        localStorage.setItem('apex_last_synckey', key);
-
+        this.setRoomId(roomId);
         this.setSyncStatus('synced');
         this.updateUI();
         this.refreshCurrentView();
-        return user;
+        return data;
       }
     } catch (e) {
       if (!silent) {
@@ -2112,8 +2112,7 @@ const ApexCloud = {
     if (this.mqttClient) {
       try { this.mqttClient.end(true); } catch (e) {}
     }
-    DB.set('ap_cloud_user', null, true);
-    localStorage.removeItem('apex_last_synckey');
+    this.setRoomId(null);
     this.updateUI();
     toast('Sessão terminada neste dispositivo.', 'info');
   },
@@ -2143,27 +2142,28 @@ const ApexCloud = {
   },
 
   updateUI() {
-    const user = this.getUser();
     const p = getProfile();
     const nameEl = document.getElementById('sidebar-name');
-    if (nameEl) nameEl.textContent = user ? (user.name || p.name || 'Atleta') : (p.name || 'Atleta');
-    this.setSyncStatus(this.getSyncKey() ? 'synced' : 'none');
+    if (nameEl) nameEl.textContent = p.name || 'Atleta';
+    this.setSyncStatus(this.getRoomId() ? 'synced' : 'none');
   },
 
   init() {
     const hash = window.location.hash;
-    if (hash && hash.includes('sync=')) {
-      const key = hash.split('sync=')[1].split('&')[0];
+    if (hash && (hash.includes('room=') || hash.includes('sync='))) {
+      const key = (hash.includes('room=') ? hash.split('room=')[1] : hash.split('sync=')[1]).split('&')[0];
       if (key) {
         setTimeout(async () => {
           try {
-            await this.pullByKey(key);
-            toast('Dispositivo emparelhado e sincronizado com sucesso! 🎉', 'ok');
+            await this.pullFromRoom(key);
+            this.setRoomId(key);
+            this.connectLive();
+            toast('Dispositivo conectado e sincronizado com sucesso! 🎉', 'ok');
             history.replaceState(null, null, ' ');
           } catch (e) {
-            toast('Erro ao sincronizar via link', 'err');
+            toast('Erro ao ligar à sala de sincronização', 'err');
           }
-        }, 300);
+        }, 200);
       }
     }
 
@@ -2178,122 +2178,129 @@ const ApexCloud = {
     this.updateUI();
     this.connectLive();
 
-    // Fast polling fallback every 4 seconds to guarantee sync on mobile/background
+    // Fast polling fallback every 3 seconds to guarantee 100% sync
     setInterval(() => {
-      const key = this.getSyncKey();
-      if (key && navigator.onLine && !this.isSyncing) {
-        this.pullByKey(key, true);
+      const roomId = this.getRoomId();
+      if (roomId && navigator.onLine && !this.isSyncing) {
+        this.pullFromRoom(roomId, true);
       }
-    }, 4000);
+    }, 3000);
 
     window.addEventListener('focus', () => {
-      const key = this.getSyncKey();
-      if (key) {
-        this.pullByKey(key, true);
+      const roomId = this.getRoomId();
+      if (roomId) {
+        this.pullFromRoom(roomId, true);
         this.connectLive();
       }
     });
 
     window.addEventListener('online', () => {
       this.connectLive();
-      const key = this.getSyncKey();
-      if (key) this.push().catch(() => {});
+      const roomId = this.getRoomId();
+      if (roomId) this.createOrPushRoom().catch(() => {});
     });
   }
 };
 
 function openAuthModal(tab = 'pair') {
-  const user = ApexCloud.getUser();
-  const currentKey = (user && user.syncKey) || localStorage.getItem('apex_last_synckey') || '';
-  const shareUrl = currentKey ? `${window.location.origin}${window.location.pathname}#sync=${currentKey}` : '';
-  const qrUrl = shareUrl ? `https://api.qrserver.com/v1/create-qr-code/?size=160x160&data=${encodeURIComponent(shareUrl)}` : '';
+  const currentRoom = ApexCloud.getRoomId();
+  const shareUrl = currentRoom ? `${window.location.origin}${window.location.pathname}#room=${currentRoom}` : '';
+  const qrUrl = shareUrl ? `https://api.qrserver.com/v1/create-qr-code/?size=170x170&data=${encodeURIComponent(shareUrl)}` : '';
 
   openModal(`
     <div style="display:flex;flex-direction:column;gap:14px">
       <div class="flex justify-between items-center">
-        <div class="text-lg">☁️ Sincronização Multi-Dispositivo</div>
+        <div class="text-lg">☁️ Sincronização em Tempo Real</div>
         <button class="btn btn-secondary btn-sm" onclick="closeModal()">✕</button>
       </div>
 
       <div style="display:flex;gap:6px;border-bottom:1px solid var(--border);padding-bottom:8px">
         <button class="btn ${tab==='pair'?'btn-primary':'btn-secondary'} btn-sm" style="flex:1" onclick="openAuthModal('pair')">📲 Enviar deste Dispositivo</button>
-        <button class="btn ${tab==='receive'?'btn-primary':'btn-secondary'} btn-sm" style="flex:1" onclick="openAuthModal('receive')">📥 Receber / Conectar</button>
+        <button class="btn ${tab==='receive'?'btn-primary':'btn-secondary'} btn-sm" style="flex:1" onclick="openAuthModal('receive')">📥 Conectar / Receber</button>
       </div>
 
       ${tab === 'pair' ? `
         <div style="display:flex;flex-direction:column;gap:12px">
-          <div class="text-xs text-muted">Gera um código ou lê o QR Code com o teu telemóvel para transferir e sincronizar todos os treinos e calorias:</div>
+          <div class="text-xs text-muted">Cria ou atualiza a tua sala na nuvem para sincronizar instantaneamente com o telemóvel:</div>
           
-          <button class="btn btn-primary w100" id="btn-gen-cloud" onclick="handleGenerateCloudKey()">
-            ☁️ Gerar Código de Sincronização
+          <button class="btn btn-primary w100" id="btn-gen-cloud" onclick="handleGenerateCloudRoom()">
+            ☁️ ${currentRoom ? '🔄 Atualizar Sala na Nuvem' : '✨ Criar Sala de Sincronização'}
           </button>
 
-          <div id="cloud-key-box" style="${currentKey ? 'display:flex' : 'display:none'};flex-direction:column;gap:10px;background:var(--card);border:1px solid var(--green);border-radius:8px;padding:14px;align-items:center;text-align:center">
-            <div class="text-xs text-green" style="font-weight:700">✓ DADOS PRONTOS NA NUVEM!</div>
+          <div id="cloud-key-box" style="${currentRoom ? 'display:flex' : 'display:none'};flex-direction:column;gap:10px;background:var(--card);border:1px solid var(--green);border-radius:8px;padding:14px;align-items:center;text-align:center">
+            <div class="text-xs text-green" style="font-weight:700">🟢 SALA ATIVA EM TEMPO REAL</div>
             
-            <div style="font-size:11px;color:var(--slate3)">O teu Código de Sincronização:</div>
-            <div id="display-sync-key" style="font-size:24px;font-weight:900;letter-spacing:3px;color:var(--green);background:var(--surface);padding:8px 18px;border-radius:6px;border:1px dashed var(--green)">
-              ${currentKey || '—'}
-            </div>
-
             ${qrUrl ? `
-              <div style="margin-top:6px">
-                <img id="qr-img" src="${qrUrl}" alt="QR Code de Sincronização" style="border-radius:8px;border:2px solid #fff;background:#fff;padding:4px">
-                <div class="text-xs text-muted mt1">Aponta a câmara do telemóvel para abrir diretamente</div>
+              <div style="margin:4px 0">
+                <img id="qr-img" src="${qrUrl}" alt="QR Code de Sincronização" style="border-radius:8px;border:3px solid #fff;background:#fff;padding:4px;width:170px;height:170px">
+                <div class="text-xs text-green mt1" style="font-weight:700">📸 Aponta a câmara do telemóvel para conectar na hora!</div>
               </div>
             ` : ''}
+
+            <div style="font-size:11px;color:var(--slate3);margin-top:6px">ID Permanente da Sala:</div>
+            <div id="display-sync-key" style="font-size:13px;font-weight:800;letter-spacing:1px;color:var(--slate1);background:var(--surface);padding:8px 12px;border-radius:6px;border:1px dashed var(--border);word-break:break-all;user-select:all">
+              ${currentRoom || '—'}
+            </div>
+
+            <button class="btn btn-secondary btn-sm w100 mt1" onclick="navigator.clipboard.writeText('${shareUrl}');toast('Link copiado!');">
+              📋 Copiar Link de Conexão
+            </button>
           </div>
         </div>
       ` : `
         <div style="display:flex;flex-direction:column;gap:12px">
-          <div class="text-xs text-muted">Introduz o Código de Sincronização gerado no teu outro dispositivo (ex: no teu PC):</div>
+          <div class="text-xs text-muted">Introduz o ID da Sala gerado no teu outro computador ou cola o link de conexão:</div>
           
           <div>
-            <label>Código de Sincronização</label>
-            <input type="text" id="input-sync-key" placeholder="Ex: EIBBLqo7UC" style="font-size:18px;font-weight:800;text-align:center;letter-spacing:2px;text-transform:none" autofocus>
+            <label>ID da Sala ou Link</label>
+            <input type="text" id="input-sync-key" placeholder="Cola o ID da sala aqui..." style="font-size:13px;padding:10px" autofocus>
           </div>
 
-          <button class="btn btn-primary w100 mt1" onclick="handleConnectKey()">
-            📥 Conectar & Sincronizar Tudo
+          <button class="btn btn-primary w100 mt1" onclick="handleConnectRoom()">
+            📥 Conectar & Sincronizar em Tempo Real
           </button>
           
-          <div class="text-xs text-muted" style="text-align:center">Todos os treinos, alimentos e métricas serão transferidos instantaneamente.</div>
+          <div class="text-xs text-muted" style="text-align:center">Qualquer alteração de água, calorias ou treinos atualizará automaticamente ambos os aparelhos.</div>
         </div>
       `}
     </div>
   `);
 }
 
-async function handleGenerateCloudKey() {
+async function handleGenerateCloudRoom() {
   const btn = document.getElementById('btn-gen-cloud');
-  if (btn) { btn.disabled = true; btn.textContent = '⏳ A enviar dados para a nuvem...'; }
+  if (btn) { btn.disabled = true; btn.textContent = '⏳ A conectar à nuvem...'; }
 
   try {
-    const key = await ApexCloud.push();
-    toast('Dados guardados na nuvem com sucesso! ☁️', 'ok');
+    const roomId = await ApexCloud.createOrPushRoom();
+    toast('Sala ativa e sincronizada! ☁️', 'ok');
     openAuthModal('pair');
   } catch (err) {
     toast('Erro ao ligar à nuvem. Tenta novamente.', 'err');
-    if (btn) { btn.disabled = false; btn.textContent = '☁️ Gerar Código de Sincronização'; }
+    if (btn) { btn.disabled = false; btn.textContent = '☁️ Criar Sala de Sincronização'; }
   }
 }
 
-async function handleConnectKey() {
+async function handleConnectRoom() {
   const input = document.getElementById('input-sync-key');
-  const key = (input ? input.value : '').trim();
+  let val = (input ? input.value : '').trim();
 
-  if (!key) {
-    toast('Digita o código de sincronização.', 'err');
+  if (!val) {
+    toast('Digita o ID da sala ou o link.', 'err');
     return;
   }
 
-  toast('A transferir dados da nuvem...', 'info');
+  if (val.includes('room=')) val = val.split('room=')[1].split('&')[0];
+  if (val.includes('sync=')) val = val.split('sync=')[1].split('&')[0];
+
+  toast('A conectar à sala...', 'info');
   try {
-    await ApexCloud.pullByKey(key);
-    toast('Sincronização concluída com sucesso! 🎉', 'ok');
+    await ApexCloud.pullFromRoom(val);
+    ApexCloud.connectLive();
+    toast('Conectado à sala! Sincronização em tempo real ativa ⚡', 'ok');
     closeModal();
   } catch (err) {
-    toast(err.message || 'Código inválido ou expirado.', 'err');
+    toast(err.message || 'ID de sala inválido.', 'err');
   }
 }
 
